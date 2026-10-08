@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+configs/rbac/agent-kubeconfig.yaml
+configs/rbac/agent-kubeconfig-docker.yaml
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+*.png
