@@ -1,0 +1,28 @@
+# Points Argo CD at the GitOps config repo. Once applied, merging a PR to
+# `main` there is enough to update the cluster — no human runs kubectl by
+# hand after that point. The approval gate that matters (the LangGraph
+# interrupt, before the PR is even opened) is unaffected by any of this;
+# Argo CD only replaces the manual "kubectl apply" step that used to happen
+# after a merge.
+#
+# EDIT the repoURL below to your own GitOps repo before applying.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: incident-agent-workloads
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/sayantan1718/k8s-gitops-config.git
+    targetRevision: main
+    path: manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: failure-lab
+  syncPolicy:
+    automated:
+      prune: true      # removes cluster resources whose manifest was deleted from git
+      selfHeal: true    # reverts manual kubectl edits back to what git says
+    syncOptions:
+      - CreateNamespace=true
