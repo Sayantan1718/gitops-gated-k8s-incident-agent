@@ -1,0 +1,21 @@
+services:
+  agent-api:
+    build: .
+    env_file: .env
+    environment:
+      # Overrides the .env value — inside the container we use the
+      # docker-network-reachable kubeconfig, not the host's 127.0.0.1 one.
+      KUBECONFIG_PATH: /app/kubeconfig.yaml
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./configs/rbac/agent-kubeconfig-docker.yaml:/app/kubeconfig.yaml:ro
+    networks:
+      - kind
+
+networks:
+  kind:
+    # kind creates this network itself when the cluster is created — we're
+    # joining it, not creating it. If this fails with "network not found",
+    # your kind cluster isn't running (see README troubleshooting).
+    external: true
