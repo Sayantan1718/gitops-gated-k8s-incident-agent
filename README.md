@@ -1,230 +1,269 @@
 # GitOps-Gated Kubernetes Incident Remediation Agent
 
-An agent that watches for a handful of common Kubernetes failures, figures out what's wrong using an LLM, and opens a pull request with a proposed fix. It never touches the cluster except to read from it — every actual change goes through a normal PR review and merge, the same as any other config change would.
+An agent that notices common Kubernetes failures, works out what went wrong with an LLM, and opens a pull request with a proposed fix. It can read your cluster but it can't change it. Every fix goes through a normal PR review, and a human merges it.
 
-## Why it's built this way
+**Maturity: suggest-only.** It diagnoses and proposes. It does not auto-remediate, and that's deliberate.
 
-Most "AI SRE" demos give the model direct `kubectl apply` access. That's the part that makes them unusable for anything real: a wrong or hallucinated fix lands straight on a live cluster, with nobody checking it first.
+## Why I built it this way
 
-This agent can't do that even if it wanted to. Its Kubernetes credentials are read-only, enforced by RBAC and verified with an actual test (not just "the prompt tells it not to write anything"). The only thing it's capable of writing to is a git branch, and only a human merging that branch causes anything to change in the cluster. That's the whole design — everything else here is plumbing to make that one property true and demonstrable end to end.
+Plenty of "AI SRE" demos give the model direct `kubectl` access. That works right up until it confidently applies a wrong fix to a live cluster and nobody sees it coming.
 
-**Stage this reaches: suggest-only.** It diagnoses, proposes, and opens a PR. It does not auto-remediate, and it's not meant to.
+This project goes the other way. The agent's Kubernetes credentials are read-only, enforced by RBAC and checked by an automated test, so a write attempt gets a real `403` from the API server. The only place it can write to is a git branch, and nothing reaches the cluster until a person merges that branch. The LLM's reach is limited by the infrastructure, not by a line in a prompt asking it to behave.
 
-## How a run actually goes
+## How a run works
 
 ```mermaid
 flowchart LR
-    A[Unhealthy pod in cluster] --> B[diagnose: classify failure,\npull logs + revision history]
-    B --> C[Gemini: root cause +\nproposed fix]
+    A[Unhealthy pod] --> B[Diagnose<br/>classify failure, pull logs<br/>and recent deploy changes]
+    B --> C[Gemini<br/>root cause and<br/>proposed fix]
     C --> D{Human approval}
     D -- reject --> E[Nothing happens]
-    D -- approve --> F[Open PR against\nGitOps config repo]
-    F --> G[Human merges PR]
-    G --> H[Argo CD / Flux / CI\napplies the change normally]
+    D -- approve --> F[Open PR on the<br/>GitOps config repo]
+    F --> G[CI schema check<br/>then human merges]
+    G --> H[Argo CD applies<br/>the change]
 ```
 
-The agent's own involvement stops at step F. Everything after that is just a normal git workflow.
+The pipeline is a LangGraph graph with an `interrupt()` before the PR step. There's no edge from the proposal straight to PR creation, so skipping approval would mean rewriting the graph, not flipping a flag.
 
 ## Failure classes it recognizes
 
-- `OOMKilled` — container exceeded its memory limit
-- `CrashLoopBackOff` — container keeps exiting on startup
-- `ImagePullBackOff` / `ErrImagePull` — bad or missing image reference
-- HPA thrashing — **detection not implemented**, see Limitations
+| Class | What it means |
+|---|---|
+| `OOMKilled` | Container exceeded its memory limit |
+| `CrashLoopBackOff` | Container keeps exiting on startup |
+| `ImagePullBackOff` / `ErrImagePull` | Bad or missing image reference |
 
-## Repo layout
+HPA thrashing is **not** detected. See [Known limitations](#known-limitations).
 
-```
-src/
-  agent/      classifier, Gemini client, LangGraph graph, pydantic models
-  k8s/        read-only Kubernetes client wrapper
-  gitops/     GitHub PR client, YAML patch-merge logic
-  api/        FastAPI wrapper (settings, routes)
-configs/
-  rbac/       ServiceAccount + ClusterRole + ClusterRoleBinding (read-only)
-  failure-scenarios/   manifests that deliberately break in each way, for local testing
-infra/        kind cluster config, kubeconfig-generation scripts
-scripts/      manual CLI entry points (scan, propose, run, verify)
-tests/        unit tests, mostly mocked; a couple of integration tests need a live cluster
-gitops-repo-seed/   NOT part of this repo — contents for a separate GitOps config repo
-```
+## Quick start (local)
 
-That last one trips people up (it tripped me up while building this): `gitops-repo-seed/` is the starting point for a *second*, separate GitHub repo. The agent opens PRs against that repo, not this one.
+You'll need Docker Desktop, `kubectl`, `kind`, Python 3.11 or 3.12, a [Gemini API key](https://aistudio.google.com/apikey), and a GitHub repo to act as your GitOps config repo.
 
-## Running it locally
+The commands below are PowerShell. The `.sh` equivalents of the helper scripts are in `infra/`.
 
-You need Docker Desktop, `kubectl`, and `kind`. On Windows without Chocolatey, `kind` is a single binary — grab it directly from the [kind releases page](https://github.com/kubernetes-sigs/kind/releases) and put it on your PATH.
+### 1. The GitOps config repo
 
-Every time you sit down to work on this, start here. Docker Desktop reassigns kind's host port on every restart, so `kubectl` is usually pointing at a dead port after a reboot — rather than chase that down, just recreate the cluster. It's disposable by design and takes under a minute.
+The agent opens PRs against a separate repo, not this one. Create an empty GitHub repo (for example `k8s-gitops-config`) and push the contents of `gitops-repo-seed/` to it, as the root of that repo. Its own README explains the layout. It also includes a CI workflow that schema-checks every PR with `kubeconform`.
+
+Then create a **fine-grained** GitHub token scoped to only that repo, with Contents and Pull requests set to read/write. Don't use a classic token.
+
+### 2. Configure
 
 ```powershell
-docker version
-kind delete cluster --name incident-agent-dev
+Copy-Item .env.example .env
+```
+
+Fill in `GEMINI_API_KEY`, `GIT_TOKEN`, `GIT_REPO` (as `your-username/k8s-gitops-config`) and `GIT_BASE_BRANCH`. `.env` is gitignored.
+
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
+pip install -e ".[dev]"
+```
+
+### 3. Start the cluster and lock down the agent
+
+```powershell
 kind create cluster --config infra/kind-config.yaml
-kubectl get nodes                          # wait for both Ready
+kubectl get nodes    # wait until both are Ready
 
 kubectl apply -f configs/rbac/service-account.yaml
 kubectl apply -f configs/rbac/cluster-role.yaml
 kubectl apply -f configs/rbac/cluster-role-binding.yaml
-.\infra\generate-agent-kubeconfig.ps1
-python scripts/verify_rbac.py               # confirms read works, write is rejected
 
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\infra\generate-agent-kubeconfig.ps1
+python scripts/verify_rbac.py
+```
+
+`verify_rbac.py` should print a successful read and then a `403 Forbidden` on a write. If it doesn't, stop and fix that before going further.
+
+### 4. Break something on purpose
+
+```powershell
 kubectl apply -f configs/failure-scenarios/00-namespace.yaml
 kubectl apply -f configs/failure-scenarios/01-oom-killed.yaml
 Start-Sleep -Seconds 30
-kubectl get pods -n failure-lab             # should show OOMKilled cycling
-
-python scripts/run_agent.py failure-lab
-# review the proposal, type 'y' to open a real PR
-
-kubectl delete -f configs/failure-scenarios/01-oom-killed.yaml
+kubectl get pods -n failure-lab
 ```
 
-One-time setup before any of that works: copy `.env.example` to `.env` and fill in `GEMINI_API_KEY` (from Google AI Studio) and `GIT_TOKEN`/`GIT_REPO`/`GIT_BASE_BRANCH` for the separate GitOps repo — see `gitops-repo-seed/README.md` for how to set that repo up. Use a fine-grained GitHub token scoped to just that one repo with Contents and Pull Requests read/write, nothing broader.
+You should see the pod cycling through `OOMKilled` and `CrashLoopBackOff`. `02-crashloop-backoff.yaml` and `03-image-pull-backoff.yaml` work the same way. The HPA scenario needs `scripts/install-metrics-server.sh` first, and it's timing-dependent, so treat it as best effort.
+
+### 5. Run the agent
 
 ```powershell
-pip install -e ".[dev]"
-pytest -m "not integration" -v      # 32 tests, no cluster needed
-pytest -m integration -v            # needs the kind cluster up and RBAC applied
+python scripts/run_agent.py failure-lab
 ```
 
-## Running it via the API
+It prints the diagnosis and the proposed patch, then waits. Type `y` and it opens a PR on your GitOps repo. Type `n` and nothing happens anywhere.
+
+Docker Desktop hands kind a new host port every time it restarts, so after a reboot `kubectl` often points at a dead port. Don't debug it. Run `kind delete cluster --name incident-agent-dev`, recreate it, and redo steps 3 and 4. The cluster is disposable by design.
+
+## Running it as an API
 
 ```powershell
 .\infra\generate-agent-kubeconfig-docker.ps1
 docker compose up --build
 ```
 
-The container reaches the cluster over kind's own Docker network (`kind`) rather than through the host-mapped port, since `127.0.0.1` inside a container isn't the same `127.0.0.1` as your host. If `docker compose up` fails with "network kind not found," the kind cluster isn't running.
+Interactive docs are at `http://127.0.0.1:8000/docs`.
 
-```
-GET  /health
-GET  /diagnostics/{namespace}                read-only, no LLM call, safe to poll
-POST /incidents/{namespace}/scan             diagnose + propose, pauses for approval
-POST /incidents/{thread_id}/decision         resumes with {"approved": true/false}
-POST /webhook/cluster-event                  stub entrypoint, see Limitations
-```
+| Endpoint | What it does |
+|---|---|
+| `GET /health` | Liveness check |
+| `GET /diagnostics/{namespace}` | Read-only scan. No LLM call, safe to poll |
+| `POST /incidents/{namespace}/scan` | Diagnose and propose. Pauses at approval and returns a `thread_id` |
+| `POST /incidents/{thread_id}/decision` | Resume with `{"approved": true}` or `false` |
+| `POST /webhook/cluster-event` | Stub entrypoint for an external alert source |
 
-Interactive docs at `http://127.0.0.1:8000/docs` once it's running.
+Approval is split across two calls because an HTTP request can't sit waiting for a person. Same pause-and-resume mechanism as the CLI, just addressed by `thread_id`. If the server restarts between the two calls, the pending approval is lost and `/decision` returns a clear `404`.
+
+The container can't use the host's `127.0.0.1` to reach kind, because inside a container that address means the container itself. The `-docker` kubeconfig points at the control-plane node by name over kind's own Docker network instead, and `docker-compose.yml` joins that network.
 
 ## Closing the loop with Argo CD
 
-Everything above stops at "PR opened" — merging and applying to the cluster
-was always a manual `kubectl apply` after that. This section automates that
-last step, without touching the approval gate: Argo CD only starts working
-*after* a PR is merged, so the human decision inside this agent (and now a
-CI schema check on top of it) still happens exactly where it did before.
+Without this, merging a PR changes the repo and then someone still has to run `kubectl apply`. Argo CD takes over that last step. It doesn't touch the approval gate, because it only starts working after a merge.
 
-Install Argo CD into the kind cluster:
 ```powershell
 kubectl create namespace argocd
 kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
 kubectl -n argocd rollout status deployment/argocd-server --timeout=180s
 ```
 
-Point it at your GitOps repo — edit `repoURL` in
-`configs/argocd/incident-agent-app.yaml` to your own `k8s-gitops-config`
-first, then:
+Edit `repoURL` in `configs/argocd/incident-agent-app.yaml` to point at your GitOps repo, then apply it. If that repo is private, Argo CD needs credentials first, otherwise you'll see `authentication required: Repository not found`:
+
 ```powershell
 kubectl apply -f configs/argocd/incident-agent-app.yaml
-```
 
-**If `k8s-gitops-config` is a private repo** (likely, if you followed the
-earlier setup), Argo CD needs explicit credentials — a fresh install has
-none registered, so you'll see `authentication required: Repository not
-found` until you add them. Reuse the same token from `.env`:
-```powershell
-kubectl create secret generic k8s-gitops-config-creds -n argocd `
+kubectl create secret generic gitops-repo-creds -n argocd `
   --from-literal=type=git `
   --from-literal=url=https://github.com/YOUR-USERNAME/k8s-gitops-config `
   --from-literal=username=YOUR-USERNAME `
   --from-literal=password=YOUR-GIT-TOKEN
-
-kubectl label secret k8s-gitops-config-creds -n argocd argocd.argoproj.io/secret-type=repository
-kubectl -n argocd patch application incident-agent-workloads --type merge -p "{\"metadata\":{\"annotations\":{\"argocd.argoproj.io/refresh\":\"hard\"}}}"
+kubectl label secret gitops-repo-creds -n argocd argocd.argoproj.io/secret-type=repository
 ```
 
-Check in on it via the UI:
+To open the UI:
+
 ```powershell
 kubectl port-forward svc/argocd-server -n argocd 8080:443
-```
-Get the admin password (the secret stores it base64-encoded, so decode it):
-```powershell
+
 $encoded = kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}"
 [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($encoded))
 ```
-Open `https://localhost:8080`, log in as `admin` with that password (accept
-the self-signed cert warning), and you should see `incident-agent-workloads`
-syncing from your repo.
 
-From here, merging any of the agent's PRs — including the ones already
-opened in earlier testing — gets picked up and applied automatically, no
-`kubectl apply` required. `selfHeal: true` in the Application means it'll
-also revert any manual `kubectl edit` on those resources back to whatever
-git says, which is the actual point of GitOps: git, not the live cluster
-state, is the source of truth.
+Log in at `https://localhost:8080` as `admin` with that password. The Application uses `selfHeal` (manual edits get reverted to match git) and `prune` (resources deleted from git are deleted from the cluster).
 
-**Also added:** `gitops-repo-seed/.github/workflows/validate-manifests.yml`
-runs `kubeconform` against every PR to that repo — including the agent's own
-— before a human reviews it. It validates against Kubernetes' real schemas
-with no cluster access needed (I checked: `kubectl --dry-run=client` still
-requires a reachable API server even in client mode, which would've silently
-failed against GitHub's runners). This isn't a replacement for the human
-approval gate; it's a check that runs before the human sees the diff, so
-they're reviewing a manifest that's at least structurally valid.
+Argo CD tracks two separate things. **Sync** says whether the cluster matches git. **Health** says whether the workload is actually working. The demo pods are broken on purpose, so "synced but unhealthy" is exactly what you should see.
 
-## Running it against a real cluster
+## What a proposal looks like
 
-This was built and tested exclusively against a local `kind` cluster. Getting it onto a real cluster would need at least the following changes, none of which are made here:
+The PR body the agent writes has this shape. The values below come from a real run:
 
-- Swap the `ClusterRoleBinding` for a namespaced `Role`/`RoleBinding`, scoped to whichever namespaces the agent should actually watch. The cluster-wide binding here is a local-dev convenience, not something to carry into a shared cluster.
-- Replace `InMemorySaver` with `PostgresSaver` or `SqliteSaver`. The in-memory checkpointer loses every pending approval if the process restarts — fine for a demo, not fine for something people are meant to trust with real incidents.
-- Put some form of auth in front of the FastAPI service. Right now anyone who can reach it can trigger a scan or approve a PR.
-- Wire `/webhook/cluster-event` up to something real — Prometheus Alertmanager, a custom event watcher, whatever your cluster already uses to detect these failures. As shipped it's just a stub that proves the entrypoint's shape.
-- Get the service account's credentials from wherever your cluster already manages workload identity (IRSA on EKS, Workload Identity on GKE, etc.) instead of a long-lived static token baked into a kubeconfig file.
+```
+Automated incident remediation proposal
+(Opened by an automated agent with read-only cluster access.
+ A human must review and merge.)
 
-## What's actually been demonstrated
+What it saw
+- Pod: oom-demo-76ddc94454-rdgmv (namespace failure-lab)
+- Failure class: oom_killed, reason OOMKilled, restart count 40
 
-Multiple full cycles, both through the CLI and through the API, each ending in a real PR against a real GitHub repo — diagnosis, Gemini's proposal, a human approval gate that genuinely blocks progress until answered, and a PR with the reasoning trace in the body. Also demonstrated: RBAC actually rejecting a write call (not just documented as read-only, tested), and the rejection path (declining a proposal opens no PR and changes nothing).
+Root cause (high confidence)
+The container exceeded its memory limit and was terminated by the
+kernel OOM killer.
 
-Not demonstrated: HPA thrash detection, multiple concurrent incidents, or anything running for longer than a manual test session.
+Proposed change
+Increase the memory limit and request for the stress container.
 
-## Known gaps and limitations
+    resources:
+      limits:   { memory: 256Mi }
+      requests: { memory: 128Mi }
 
-**HPA thrashing isn't detected.** The other three failure classes show up as a straightforward pod status at a single point in time. Thrashing is a pattern over time — you'd need to watch the HPA's replica count oscillate, which means time-series data, not a single snapshot. The scenario manifests exist for manual testing, but nothing in `classifier.py` looks for it.
+Risk notes
+If the workload allocates memory without bound, raising the limit only
+delays the next OOMKill. Check node capacity first.
+```
 
-**The "recent deploy history" signal isn't actually git history.** The project brief called for diffing git log against the failure. This local setup doesn't have a real GitOps controller applying changes from a git repo — manifests get `kubectl apply`'d directly. So instead, the diagnosis node diffs consecutive Kubernetes `ReplicaSet` revisions, which carries roughly the same information (what changed in the last deploy) without needing to fake a git-backed pipeline. In a setup with a real Argo CD or Flux controller, this should read actual git history instead.
+## Tests
 
-**Gemini's output isn't fully deterministic.** Two runs against the identical failure can word the root cause differently, suggest slightly different memory values, or (this happened during testing) double-escape newlines inside the YAML patch, which broke YAML parsing until it was handled defensively. The patch-merge logic normalizes escaped newlines and raises a clear error if a patch still doesn't parse, but this is a real characteristic of the pipeline, not a hypothetical edge case.
+```powershell
+pytest -m "not integration" -v    # 32 tests, mocked, no cluster or API keys needed
+pytest -m integration -v          # needs the kind cluster up and RBAC applied
+```
 
-**The YAML patch-merge doesn't preserve comments or key order.** It uses `PyYAML`'s `safe_load`/`safe_dump`, so committing a patch reformats the whole file. `ruamel.yaml` would preserve formatting at the cost of a heavier dependency and more code — a reasonable tradeoff for a demo, not necessarily for a real repo other people are editing by hand.
+Unit tests cover the classifier, the log edge cases, the YAML patch merge, the GitHub PR flow, the serialization boundary in the graph, and every API endpoint. The integration tests are the RBAC checks: one confirms reads work, one confirms a write is rejected.
 
-**The GitOps repo convention is a hardcoded naming scheme.** The agent expects `manifests/<deployment-name>.yaml`, one file per Deployment. Real GitOps repos more often use Kustomize overlays or Helm values, which this doesn't understand at all.
+## Project layout
 
-**The FastAPI service keeps process-global state.** `_graph` and `_k8s_loaded` are module-level, and the checkpointer is in-memory. That means a `/scan` and its matching `/decision` have to land on the same process — this would break under multiple replicas or any horizontal scaling, and a restart between the two calls loses the pending approval (which happened during testing, and the API now returns a clear 404 for it rather than crashing).
-
-**No batching.** Each run handles one incident. If several pods are unhealthy at once, only the first one gets diagnosed.
-
-**No authentication anywhere in the API.** Every endpoint is open. Fine for `localhost`, not fine for anything reachable by anyone else.
-
-**`structlog` is a listed dependency that isn't actually used.** Logging throughout is plain `print()` statements in the CLI scripts. Worth wiring in properly before calling this production-lean rather than leaving it as an unused import waiting to be noticed.
-
-**Tested only against `kind`.** RBAC behavior, networking, and the rest are all validated on a local single-machine cluster. Managed Kubernetes (EKS, GKE, AKS) has its own quirks around service account tokens and networking that this hasn't been run against.
-
-## If something breaks
-
-A few things came up repeatedly enough while building this that they're worth writing down rather than rediscovering:
-
-- `kubectl` suddenly can't connect (`connection refused` on some `127.0.0.1` port) — the kind cluster's host port went stale after a Docker Desktop restart. Recreate the cluster; don't try to fix the old context by hand.
-- `pytest` can't find the `src` module — `conftest.py` at the repo root should prevent this. If it still happens, make sure the file actually saved (this bit me once mid-project).
-- A container can't reach the cluster on `127.0.0.1` — that address means the container itself, not your host. Use `generate-agent-kubeconfig-docker.ps1` and join the `kind` Docker network instead.
-- Gemini 404s on the model name — `gemini-3.7-flash` may not be enabled for your key/tier. List what's available with `client.models.list()` and swap `MODEL_NAME` in `src/agent/gemini_client.py`.
-- `repo.get_contents` 404s when opening a PR — the manifest file doesn't exist yet in your GitOps repo, or `GIT_REPO` doesn't match. Check the naming convention in `gitops-repo-seed/README.md`.
+```
+src/
+  agent/      classifier, Gemini client, LangGraph graph, models
+  k8s/        read-only Kubernetes client
+  gitops/     YAML patch merge, GitHub PR client
+  api/        FastAPI app and settings
+configs/
+  rbac/               ServiceAccount, ClusterRole, ClusterRoleBinding
+  failure-scenarios/  manifests that fail on purpose
+  argocd/             Argo CD Application
+infra/        kind config, kubeconfig generation scripts (.ps1 and .sh)
+scripts/      CLI entry points: scan, propose, run, verify RBAC
+tests/
+gitops-repo-seed/   contents for the SEPARATE GitOps config repo
+```
 
 ## RBAC policy
 
-The full policy is in `configs/rbac/cluster-role.yaml` — `get`/`list`/`watch` on pods, events, deployments, replicasets, and HPAs, plus `get` on pod logs. No write verb anywhere. This is enforced, not just declared: `scripts/verify_rbac.py` and `tests/test_rbac_boundary.py` both confirm a write call gets a real `403` from the API server.
+The full file is `configs/rbac/cluster-role.yaml`. It grants `get`, `list` and `watch` on pods, events, deployments, replicasets and HPAs, plus `get` on pod logs. No create, update, patch or delete verb appears anywhere in it.
+
+## Taking this to production
+
+This was built and tested only on a local `kind` cluster. Before pointing it at anything real, I'd change these things first:
+
+| Area | Now | For production |
+|---|---|---|
+| RBAC scope | `ClusterRoleBinding`, cluster-wide | Namespaced `Role` and `RoleBinding` for the namespaces it should watch |
+| Cluster credentials | Static token in a kubeconfig | Workload identity (IRSA on EKS, Workload Identity on GKE) |
+| Approval state | `InMemorySaver`, lost on restart | `PostgresSaver` or `SqliteSaver` |
+| API access | No authentication | Auth in front of every endpoint, since anyone who can reach it can approve a PR |
+| Scaling | Process-global state, one replica | Move state out of the process before running more than one replica |
+| Triggering | Manual, or a stub webhook | Real alert source such as Alertmanager |
+| Observability | `print()` in the scripts | Structured logging and metrics |
+
+## Known limitations
+
+**HPA thrashing isn't detected.** The other failure classes show up as a status at one point in time. Thrashing is a pattern over time, so it needs time-series data that a single snapshot can't give. The scenario manifests exist for manual testing, but nothing in the classifier looks for it.
+
+**"Recent deploy changes" come from ReplicaSet history, not git.** This setup has no GitOps controller applying changes from git when the failure happens, so the agent compares consecutive Deployment revisions instead. With Argo CD or Flux in the loop, reading real git history would be the better source.
+
+**LLM output isn't deterministic.** Two runs on the same failure can word things differently or pick different memory values. Once Gemini returned a YAML patch with escaped newlines, which broke parsing. The patch step now normalizes that and fails with a clear message if the patch still can't be parsed. Treat every proposal as a suggestion to review.
+
+**The patch merge rewrites the whole file.** It uses PyYAML, so comments and key order in the manifest are lost when a patch is committed. `ruamel.yaml` would preserve them.
+
+**The GitOps repo layout is hardcoded.** The agent expects `manifests/<deployment-name>.yaml`. Repos built on Kustomize or Helm won't work.
+
+**One incident per run.** If several pods are unhealthy, only the first is handled.
+
+**`structlog` is declared but not used.** Logging is plain `print()` in the CLI scripts. I'd wire it in properly before calling this production-ready.
+
+**CI only checks schema.** `kubeconform` catches typos and wrong types, but not things that need a live API server, like admission webhooks or missing ConfigMaps.
+
+## Troubleshooting
+
+**`kubectl` says connection refused on some `127.0.0.1` port.** kind's host port changed after a Docker restart. Recreate the cluster.
+
+**`pytest` can't import `src`.** `conftest.py` at the repo root handles this. If it still fails, check that the file exists and was actually saved.
+
+**A container can't reach the cluster.** Use `generate-agent-kubeconfig-docker.ps1` and make sure the kind cluster is running, so the `kind` Docker network exists.
+
+**Gemini returns a 404 for the model.** `gemini-3.7-flash` may not be enabled for your key or tier. List what you have with `client.models.list()` and change `MODEL_NAME` in `src/agent/gemini_client.py`.
+
+**`repo.get_contents` returns a 404 when opening a PR.** The manifest isn't in your GitOps repo yet, or `GIT_REPO` is wrong. The file must be at `manifests/<deployment-name>.yaml`.
+
+**`/decision` returns a 404.** That `thread_id` has no pending approval. Either it was already decided, or the server restarted after the `/scan` call.
+
+**`.ps1` scripts are blocked.** Run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` in that terminal. It only lasts for that window.
 
 ## License
 
-MIT — see `LICENSE`.
+MIT. See `LICENSE`.
