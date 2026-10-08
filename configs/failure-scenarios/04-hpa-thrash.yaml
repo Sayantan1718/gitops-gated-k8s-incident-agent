@@ -1,0 +1,75 @@
+# Aggressive scale-up/down behavior (near-zero stabilization windows) means
+# any bursty CPU load causes rapid replica oscillation instead of smooth
+# scaling. Pair with a bursty load generator (see scripts/generate-hpa-load.*)
+# to actually trigger the flapping — the HPA alone is just the misconfig.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hpa-demo
+  namespace: failure-lab
+  labels:
+    failure-class: hpa-thrash
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hpa-demo
+  template:
+    metadata:
+      labels:
+        app: hpa-demo
+    spec:
+      containers:
+        - name: app
+          image: registry.k8s.io/hpa-example
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: "50m"
+            limits:
+              cpu: "100m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hpa-demo
+  namespace: failure-lab
+spec:
+  selector:
+    app: hpa-demo
+  ports:
+    - port: 80
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: hpa-demo
+  namespace: failure-lab
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: hpa-demo
+  minReplicas: 1
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 30
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 200
+          periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 15
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15

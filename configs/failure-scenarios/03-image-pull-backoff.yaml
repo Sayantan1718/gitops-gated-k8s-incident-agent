@@ -1,0 +1,22 @@
+# References an image that doesn't exist anywhere — simulates a bad tag
+# shipped in a deploy (e.g. wrong version bump, typo, unpushed build).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: imagepull-demo
+  namespace: failure-lab
+  labels:
+    failure-class: image-pull-backoff
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: imagepull-demo
+  template:
+    metadata:
+      labels:
+        app: imagepull-demo
+    spec:
+      containers:
+        - name: app
+          image: this-registry-does-not-exist.invalid/nonexistent-app:v99.99.99

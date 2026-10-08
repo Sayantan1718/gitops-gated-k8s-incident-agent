@@ -1,0 +1,25 @@
+# Alternates between a hammering burst and an idle pause, in a loop. This
+# on/off pattern is what actually produces flapping against the aggressive
+# HPA behavior in 04-hpa-thrash.yaml — steady load would just scale up once
+# and settle, which wouldn't demonstrate thrashing.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hpa-load-generator
+  namespace: failure-lab
+spec:
+  containers:
+    - name: load-generator
+      image: busybox
+      command:
+        - "sh"
+        - "-c"
+        - >
+          while true; do
+            echo "burst start";
+            for i in $(seq 1 200); do wget -q -O- http://hpa-demo > /dev/null & done;
+            sleep 20;
+            echo "idle pause";
+            sleep 25;
+          done
+  restartPolicy: Never

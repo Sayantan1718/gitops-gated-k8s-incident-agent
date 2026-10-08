@@ -1,0 +1,23 @@
+# Container exits non-zero immediately on every start — kubelet backs off
+# restarts exponentially, producing CrashLoopBackOff within ~1 minute.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crashloop-demo
+  namespace: failure-lab
+  labels:
+    failure-class: crash-loop-backoff
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: crashloop-demo
+  template:
+    metadata:
+      labels:
+        app: crashloop-demo
+    spec:
+      containers:
+        - name: crasher
+          image: busybox
+          command: ["sh", "-c", "echo 'simulated fatal startup error'; exit 1"]
